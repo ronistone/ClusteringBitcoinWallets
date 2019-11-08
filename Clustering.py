@@ -16,6 +16,8 @@ Transaction = database['Transaction']
 AddressEntity = database['AddressEntity']
 control = database['control']
 AddressChange = database['AddressChange']
+AddressExchange = database['AddressExchange']
+
 count = 0
 
 
@@ -138,6 +140,26 @@ def get_all_address_in_transaction(transaction):
     addresses = list(set(addresses))
     return addresses
 
+def get_in_out_value_in_transaction(transaction):
+    inValue = 0
+    outValue = 0
+    inAddress = None
+    outAddress = []
+    if transaction.get('inputs') is not None:
+        for input in transaction['inputs']:
+            if input.get('prev'):
+                inValue += input.get('prev').get('value')
+            elif input.get('prev_out'):
+                inValue += input.get('prev_out').get('value')
+            if inAddress is None:
+                inAddress = getAddress(input)
+    if transaction.get('out') is not None:
+        for out in transaction['out']:
+            outValue += out.get('value')
+            outAddress.append((out.get('value'), out.get('addr')))
+    return (inValue, inAddress, outValue, outAddress)
+
+
 
 def get_all_entity_and_remove_address_already_in_db(addresses):
     addressesEntity = AddressEntity.find({"address": {"$in": addresses}})
@@ -166,12 +188,97 @@ def getAddress(inputAddress):
     return address
 
 
+def hasDone(key):
+    has = control.find_one({"name": key})
+
+    return has and has['value']
+
+
+def find_clusters_and_populate():
+    if hasDone('find_all_clusters'):
+        print('numAddress already populate!')
+        return
+
+    AddressExchange.delete_many({})
+
+    entitys = AddressEntity.distinct('entity')
+
+    for entityId in entitys:
+        entity = {'entity': entityId, 'numAddresses': AddressEntity.find({'entity': entityId}).count()}
+
+        AddressExchange.insert(entity)
+
+    define_control('find_all_clusters', True)
+
+def populate_num_transactions():
+
+    if hasDone('populate_num_transactions'):
+        return
+
+    for transaction in Transaction.find():
+        addresses = get_all_address_in_transaction(transaction)
+        entitys = list(AddressEntity.find({'address': { '$in': addresses }}))
+        entitys = [ entity['entity'] for entity in entitys ]
+        for exchange in AddressExchange.find({'entity': {'$in': entitys}}):
+            if exchange.get('numTransactions') is None:
+                AddressExchange.update_one({'_id': exchange['_id']}, { '$set': { 'numTransactions': 1 } })
+            else:
+                AddressExchange.update_one({'_id': exchange['_id']}, { '$set': { 'numTransactions': exchange['numTransactions'] + 1 } })
+
+    define_control('populate_num_transactions', True)
+
+def populate_btc_in_out():
+    if hasDone('populate_btc_in_out'):
+        return
+
+    for transaction in Transaction.find():
+        inValue, inAddress, outValue, valuesAndAddress = get_in_out_value_in_transaction(transaction)
+
+        total = inValue - outValue
+        update_total_value(inAddress, total)
+
+        for value, address in valuesAndAddress:
+            update_total_value(address, value)
+
+    define_control('populate_btc_in_out', True)
+
+
+def update_total_value(address, total):
+    entity = AddressEntity.find_one({'address': address})
+    if entity:
+        exchange = AddressExchange.find_one({'entity': entity['entity']})
+        if exchange:
+            if exchange.get('total') is None:
+                AddressExchange.update_one({'_id': exchange['_id']}, {'$set': {'total': total}})
+            else:
+                AddressExchange.update_one({'_id': exchange['_id']}, {'$set': {'total': exchange['total'] + total}})
+
+
+def populate_all_clusters():
+    find_clusters_and_populate()
+    populate_num_transactions()
+    populate_btc_in_out()
+
+def define_control(key, value):
+    element = control.find_one({'name': key})
+    if element:
+        control.update_one({"name": key}, {"$set": {"value": value}})
+    else:
+        control.insert({"name": key, "value": value})
+
 def main():
     global count
-    populateTransactionsDatabaseWhenNecessary(getTheLastBlock())
+    # populateTransactionsDatabaseWhenNecessary(getTheLastBlock())
     count = 0
-    executeH1Clustering()
+    if not hasDone("h1Done"):
+        print("doing h1 clustering")
+        executeH1Clustering()
     count = 0
-    executeH2Clustering()
+    if not hasDone("h2Done"):
+        print("doing h2 clustering")
+        executeH2Clustering()
+
+    populate_all_clusters()
+
 
 main()
